@@ -1,15 +1,38 @@
 package model
 
 import (
-	"io"
+	"encoding/xml"
+	"fmt"
 	"net/http"
 	"time"
 )
 
-type UsgResponse struct {
+type (
+	UsgReqHeaderCtx struct{}
+	UsgReqURICtx    struct{}
+	UsgRespCtx      struct{}
+)
+
+var (
+	UsgReqIdHeaderKey = "usg-Req-Id"
+)
+
+type UsgResp struct {
 	StatusCode int
-	Header     http.Header
-	Body       io.ReadCloser
+	Header     *http.Header
+	Body       any
+}
+
+type UsgErrorBody struct {
+	XMLName   xml.Name `xml:"Error" json:"-"` // 指定根节点名称
+	Code      string
+	Message   string
+	Resource  string
+	RequestId string
+}
+
+func (e *UsgErrorBody) Error() string {
+	return fmt.Sprintf("%s: %s", e.Code, e.Message)
 }
 
 type UsgBucket struct {

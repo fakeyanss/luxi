@@ -2,98 +2,106 @@ package api
 
 import (
 	"context"
-	"net/http"
+	"strconv"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/smithy-go/middleware"
-	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"github.com/fakeyanss/usg-go/internal/backend"
+	"github.com/fakeyanss/usg-go/internal/model"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/rs/zerolog/log"
 )
 
-var (
-	s3Cli *s3.Client
-
-	UsgReqIdHeader = "usg-Req-Id"
-	UsgReqKey      = "UsgRequest"
-)
-
-type (
-	AmzResHeaderCtx struct{}
-
-	UsgReqHeaderCtx struct{}
-)
-
-func initS3() {
-	sdkConf, err := config.LoadDefaultConfig(context.TODO(),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("guichen01", "guichen011", "")),
-		config.WithRegion("us-east-1"))
-	if err != nil {
-		log.Fatal().Err(err).Msg("Fail to init s3 client")
+func RegisterS3Api(group *gin.RouterGroup) {
+	s3ctl := &s3Ctl{
+		backend: backend.NewS3Backend(),
+		// backend: backend.NewFsBackend(),
 	}
-	s3Cli = s3.NewFromConfig(sdkConf, func(o *s3.Options) {
-		o.UsePathStyle = true
-		o.BaseEndpoint = aws.String("http://guichen01.bcc-bdbl.baidu.com:8021")
-	}, s3.WithAPIOptions(passResquestHeaderFunc, storeResponseHeaderFunc))
-}
 
-func passResquestHeaderFunc(stack *middleware.Stack) error {
-	return stack.Build.Add(middleware.BuildMiddlewareFunc("PassRequestHeader",
-		func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (middleware.BuildOutput, middleware.Metadata, error) {
-			switch req := in.Request.(type) {
-			case *smithyhttp.Request:
-				header := ctx.Value(UsgReqHeaderCtx{}).(http.Header)
-				for k, v := range header {
-					for _, ele := range v {
-						req.Header.Add(k, ele)
-					}
-				}
-			}
-			return next.HandleBuild(ctx, in)
-		}), middleware.Before)
-}
+	group.Use(genReqID, errHandler)
 
-func storeResponseHeaderFunc(stack *middleware.Stack) error {
-	return stack.Deserialize.Add(middleware.DeserializeMiddlewareFunc("StoreResponseHeader",
-		func(ctx context.Context, in middleware.DeserializeInput, next middleware.DeserializeHandler) (middleware.DeserializeOutput, middleware.Metadata, error) {
-			out, meta, err := next.HandleDeserialize(ctx, in)
-			if err != nil {
-				return out, meta, err
-			}
-			switch res := out.RawResponse.(type) {
-			case *smithyhttp.Response:
-				meta.Set(AmzResHeaderCtx{}, res.Header)
-			}
-
-			return out, meta, nil
-		}), middleware.Before)
+	group.GET("/", s3ctl.listBuckets)
+	group.GET("/:bucket", s3ctl.listObjects)
 }
 
 func genReqID(c *gin.Context) {
-	reqID := uuid.NewString()
-	c.Header(UsgReqIdHeader, reqID)
+	var reqID string
+	reqID = c.Request.Header.Get(model.UsgReqIdHeaderKey)
+	if reqID == "" {
+		reqID = uuid.NewString()
+		c.Request.Header.Add(model.UsgReqIdHeaderKey, reqID)
+	}
+	c.Header(model.UsgReqIdHeaderKey, reqID)
+
+	c.Next()
 }
 
-func passResponseHeader(c *gin.Context, meta middleware.Metadata) {
-	header := meta.Get(AmzResHeaderCtx{}).(http.Header)
-	for k, v := range header {
-		for _, ele := range v {
-			c.Writer.Header().Add(k, ele)
+func errHandler(c *gin.Context) {
+	c.Next()
+
+	if n := len(c.Errors); n > 0 {
+		e := c.Errors[n-1]
+		if err := e.Err; err != nil {
+			if usgErr, ok := err.(*model.UsgError); ok {
+				writeResponseByContentType(c, usgErr.HttpCode, usgErr.ToUsgErrorBody(c))
+			}
+		}
+		return
+	}
+}
+
+func passResponse(c *gin.Context, ur *model.UsgResp) {
+	if ur.Header != nil {
+		for k, v := range *ur.Header {
+			for _, ele := range v {
+				c.Writer.Header().Add(k, ele)
+			}
 		}
 	}
 	// remove content-length to avoid writing body more than the declared
-	c.Header("content-length", "")
+	c.Header("Content-Length", "")
+	// remove content-type
+	c.Header("Content-Type", "")
+
+	writeResponseByContentType(c, ur.StatusCode, ur.Body)
 }
 
-func RegisterS3Api(group *gin.RouterGroup) {
-	initS3()
+func writeResponseByContentType(c *gin.Context, code int, body any) {
+	if c.Request.Header.Get("Content-Type") == "application/json" {
+		c.JSON(code, body)
+	} else {
+		c.XML(code, body)
+	}
+}
 
-	group.Use(genReqID)
+type s3Ctl struct {
+	backend backend.StorageBackend
+}
 
-	group.GET("/", listBuckets)
-	group.GET("/:bucket", listObjects)
+func (s3 *s3Ctl) listBuckets(c *gin.Context) {
+	ctx := context.WithValue(context.Background(), model.UsgReqURICtx{}, c.Request.URL.Path)
+	ctx = context.WithValue(ctx, model.UsgReqHeaderCtx{}, c.Request.Header)
+	ur := s3.backend.ListBuckets(ctx)
+	passResponse(c, ur)
+}
+
+func (s3 *s3Ctl) listObjects(c *gin.Context) {
+	ctx := context.WithValue(context.Background(), model.UsgReqURICtx{}, c.Request.URL.Path)
+	ctx = context.WithValue(ctx, model.UsgReqHeaderCtx{}, c.Request.Header)
+
+	bucket := c.Param("bucket")
+	delimiter := c.Query("delimiter")
+	encodingType := c.Query("encoding-type")
+	marker := c.Query("marker")
+	maxKeysStr := c.Query("max-keys")
+	var maxKeys int32 = 1000
+	if maxKeysStr != "" {
+		maxKeys64, err := strconv.ParseInt(maxKeysStr, 10, 32)
+		if err != nil {
+			_ = c.Error(model.NewInvalidArgument("Invalid argument with max-keys"))
+			return
+		}
+		maxKeys = int32(maxKeys64)
+	}
+	prefix := c.Query("prefix")
+	ur := s3.backend.ListObjects(ctx, bucket, delimiter, encodingType, marker, maxKeys, prefix)
+	passResponse(c, ur)
 }
